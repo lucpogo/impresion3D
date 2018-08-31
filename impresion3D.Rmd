@@ -1,0 +1,830 @@
+---
+title: "Impresión 3D por medio de R"
+author: "Lucas Pogorelsky"
+subtitle: Presentación de LatinR 2018
+output: pdf_document
+---
+
+# Objetivo
+
+El objetivo de este trabajo es representar, por medio de la impresión 3D, la cantidad de personas que utilizan el Subte de Buenos Aires.
+
+Para ello se usarán datos provenientes del portal de datos abiertos [Buenos Aires Data](https://data.buenosaires.gob.ar/) referentes a la red de Subterráneos de Buenos Aires y las librerías `sf` para explotar los datos geográficos, `tidyverse` para la manipulación y `r2stl` para la generación del archivo _.stl_ necesario para la impresión en 3D.
+
+La impresión en 3D constará de un mapa de la Ciudad de Buenos Aires con la delimitación de los barrios, las líneas de subte y, representado por barras verticales, la cantidad de personas que se subieron en cada estación de Subte.
+
+# Archivos stl y paquete r2stl
+
+Los archivos `stl` describen una superficie utilizando triángulos y es un standard en la impresión 3D.
+
+La función `r2stl` del paquete homónimo toma como argumento coordenadas X, Y y Z  y genera el archivo _stl_.
+
+En nuestro caso, las coordenadas X e Y, las vamos a extraer de los datos geográficos, mientras que el valor de Z se desprenderá de la cantidad de gente que use los molinetes de cada estación.
+
+# Datos geográficos y Simple Features
+
+La librería `sf` utiliza Simple Features que es un standard que describe cómo representar objetos del mundo real con la computadora.
+
+En nuestro caso, se usarán los tipos geométricos:
+
+* POINT: Un punto.
+* LINESTRING: Una secuencia de puntos conectados por líneas rectas que no se intersectan.
+* POLYGON: Una secuencia depuntos conectados por líneas que forman un anillo cerrado.
+
+# Sistema
+
+## Librerías
+
+Comenzamos con la importación de las librerías a utilizar.
+
+```{r, messages=FALSE}
+suppressMessages(library(tidyverse))
+#Para manipular data GEO
+library(sf)
+#Para imprimir 3D
+library(r2stl)
+#Gráficos
+library(plotly)
+#Necesario para poder observar gráficos en 3D
+library(rgl)
+```
+
+## Especificaciones Técnicas
+
+```{r}
+sessionInfo()
+```
+
+* __Procesador:__ Intel© Core™ i7-8550U
+* __Memoria Ram:__ 16GB
+
+# Procesamiento
+
+## Descarga de Archivos
+
+Generamos la estructura de archivos, una carpeta para descarga y una para los datos descomprimidos.
+
+```{r}
+dir.create('downloads',showWarnings=FALSE)
+dir.create('data',showWarnings=FALSE)
+```
+
+Creamos la función que descarga y descomprime los archivos.
+
+```{r}
+descargaDatos <- function(archivoOrigen,archivoDestino,descargar) {
+  if (descargar){
+    #Parámetros de descarga y descompresión
+    urlArchivo <- paste0('https://data.buenosaires.gob.ar/api/files/',archivoOrigen,'/download')
+    pathDescarga <- paste0('downloads/',archivoDestino)
+    pathDatos <- paste0('data/',strsplit(archivoDestino,'\\.')[[1]][1])
+    
+    #Descarga del archivo
+    download.file(urlArchivo,pathDescarga)
+    
+    if(substr(archivoDestino,nchar(archivoDestino)-3,nchar(archivoDestino))=='.zip'){
+      #Descompresión de archivos .zip
+      unzip(pathDescarga,
+            exdir = pathDatos)
+    } else {
+      #Descompresión de archivos .rar
+      dir.create(pathDatos,showWarnings = F)
+      #Esta línea depende del sistema operativo y del programa para descomprimir rar instalado
+      cmd = paste0('unrar x -y "', getwd(), '/' , pathDescarga , '" "', getwd(), '/' , pathDatos , '"')
+      system(cmd)
+    }
+  }
+}
+```
+
+Descargamos y extraemos los archivos referentes a:
+
+* `Cantidad de usuarios de molinetes en 2018` <br>[https://data.buenosaires.gob.ar/dataset/subte-viajes-molinetes](https://data.buenosaires.gob.ar/dataset/subte-viajes-molinetes)
+* `Contorno de los barrios de Buenos Aires` <br>[https://data.buenosaires.gob.ar/dataset/barrios](https://data.buenosaires.gob.ar/dataset/barrios)
+* `Referencia geográfica de la líneas y estaciones de Subte` <br>[https://data.buenosaires.gob.ar/dataset/subte-estaciones](https://data.buenosaires.gob.ar/dataset/subte-estaciones)
+
+```{r}
+#Cambiar a TRUE en caso de querer descargar los datos
+descargar <- FALSE
+descargaDatos('molinetes-2018.zip','molinetes.zip',descargar)
+descargaDatos('barrios-rar.rar','barrios.rar',descargar)
+descargaDatos('estaciones-de-subte-rar.rar','estaciones.rar',descargar)
+descargaDatos('lineas-de-subte-rar.rar','lineas.rar',descargar)
+```
+
+## Molinetes
+
+El dataset con el uso de molinetes contiene "Cantidad de pasajeros por molinete en cada estación en rangos de a 15 minutos y discriminando según tipo de pasaje correspondiente al año 2018."
+
+Comencemos importando el archivo csv.
+
+```{r}
+molinetes <- read_csv(paste('data/molinetes',dir('data/molinetes')[1],sep='/'),progress = F)
+head(molinetes)
+summary(molinetes)
+```
+
+### Fechas
+
+Como podemos observar, la variable `FECHA` fue importada como texto. Veamos algunos casos para ver el formato de fecha y convertirlo adecuadamente.
+
+```{r}
+set.seed(1234)
+sample(unique(molinetes$FECHA),15)
+```
+
+Vemos que el formato es `'%d/%m/%Y'`.
+
+```{r}
+molinetes$FECHA <- as.Date(molinetes$FECHA,'%d/%m/%Y')
+summary(molinetes)
+```
+
+Comprobemos si la variable `PERIODO` es correcta.
+
+```{r}
+molinetes %>% 
+  group_by(PERIODO) %>% 
+  summarise(minFecha = min(FECHA), 
+            maxFecha = max(FECHA))
+```
+
+Como vemos, la variable es correcta, pero no tenemos los datos correspondientes a abril de 2018.
+
+### Limpieza de nombres
+
+Comprobemos si están todas las líneas presentes.
+
+```{r}
+length(unique(molinetes$LINEA))
+```
+
+Deberíamos tener 6 valores únicos, veamos qué sucede.
+
+```{r}
+unique(molinetes$LINEA)
+```
+
+Nos quedamos únicamente con la letra de la línea.
+
+```{r}
+molinetes$LINEA <- substr(molinetes$LINEA,nchar(molinetes$LINEA),nchar(molinetes$LINEA))
+```
+
+Veamos si las estaciones están bien. En teoría, deberíamos tener:
+
+|LINEA|CANTIDAD DE ESTACIONES|
+|-----|----------------------|
+|A|18|
+|B|17|
+|C|9|
+|D|16|
+|E|15|
+|H|12|
+
+```{r}
+molinetes %>% 
+  group_by(LINEA) %>% 
+  summarise(`CANTIDAD DE ESTACIONES`=n_distinct(ESTACION))
+```
+
+Vemos que tenemos al menos el doble de estaciones por línea, analicemos qué puede estar sucediendo.
+
+```{r}
+molinetes %>% 
+  select(LINEA,ESTACION) %>% 
+  distinct() %>% 
+  arrange(LINEA,ESTACION) %>% 
+  head(10)
+```
+
+Pasamos a mayúscula el nombre de todas las estaciones y comprobamos si se soluciona.
+
+```{r}
+molinetes$ESTACION <- toupper(molinetes$ESTACION)
+molinetes %>% 
+  group_by(LINEA) %>% 
+  summarise(ESTACIONES=n_distinct(ESTACION))
+```
+
+Las líneas A y D siguen teniendo más estaciones que las que deberíamos, veamos lo que sucede.
+
+```{r}
+molinetes %>% 
+  filter(LINEA %in% c('A','D')) %>% 
+  select(LINEA,ESTACION) %>% 
+  distinct() %>% 
+  arrange(LINEA,ESTACION)
+```
+
+El problema está en las estaciones `SAENZ PEÑA` y `AGÜERO`, lo arreglamos manualmente.
+
+```{r}
+molinetes <- molinetes %>% mutate(ESTACION=case_when(LINEA=='A' & substr(ESTACION,1,5)=='SAENZ' ~ 'SAENZ PEÑA',
+                                                     LINEA=='D' & substr(ESTACION,1,2)=='AG' ~ 'AGÜERO',
+                                                     TRUE ~ ESTACION))
+
+molinetes %>% 
+  group_by(LINEA) %>% 
+  summarise(ESTACIONES=n_distinct(ESTACION))
+```
+
+Finalmente tenemos los datos de estaciones limpios.
+
+### Combinaciones
+
+Debido a que los usuarios no necesariamente utilizan el molinete de la línea en la que viajan, vamos a considerar las combinaciones como una estación en su totalidad.
+
+Generamos el DataFrame que indica qué estaciones corresponden a las combinaciones:
+
+```{r}
+combinaciones <- c('A','LIMA','COMB A-C',
+                   'C','AVENIDA DE MAYO', 'COMB A-C',
+                   'A','PERU','COMB A-D-E',
+                   'D','CATEDRAL','COMB A-D-E',
+                   'E','BOLIVAR','COMB A-D-E',
+                   'A','PLAZA MISERERE','COMB A-H',
+                   'H','ONCE','COMB A-H',
+                   'B','CARLOS PELLEGRINI','COMB B-C-D',
+                   'C','DIAGONAL NORTE','COMB B-C-D',
+                   'D','9 DE JULIO','COMB B-C-D',
+                   'B','PUEYRREDON','COMB B-H',
+                   'H','CORRIENTES','COMB B-H',
+                   'C','INDEPENDENCIA','COMB C-E',
+                   'E','INDEPENDENCIA.H','COMB C-E',
+                   'D','PUEYRREDON.D','COMB D-H',
+                   'H','SANTA FE','COMB D-H',
+                   'E','JUJUY','COMB E-H',
+                   'H','HUMBERTO I','COMB E-H'
+)
+
+combinaciones <- data.frame(LINEA = combinaciones[seq(1,length(combinaciones),3)],
+                            ESTACION = combinaciones[seq(2,length(combinaciones),3)],
+                            COMBINACION = combinaciones[seq(3,length(combinaciones),3)],
+                            stringsAsFactors = F)
+```
+
+### Cantidad de Usuarios por Estación
+
+Finalmente, ya con los datos limpios y las combinaciones establecidas, procedemos a calcular la cantidad mensual promedio de pasajeros que comienzan el recorrido en cada estación.
+
+```{r}
+molinetesCantidad <- molinetes %>%
+                      left_join(combinaciones, by=c('LINEA','ESTACION')) %>%
+                      mutate(COMBINACION = ifelse(is.na(COMBINACION),paste(LINEA,ESTACION,sep='|'),COMBINACION)) %>%
+                      group_by(COMBINACION,PERIODO) %>%
+                      summarise(cantidad = sum(TOTAL)) %>%
+                      group_by(COMBINACION) %>%
+                      summarise(cantidad = mean(cantidad)) %>%
+                      ungroup() %>%
+                      left_join(combinaciones, by="COMBINACION") %>%
+                      mutate(LINEA = ifelse(is.na(LINEA),substr(COMBINACION,1,1),LINEA),
+                             ESTACION = ifelse(is.na(ESTACION),substr(COMBINACION,3,nchar(COMBINACION)),ESTACION))
+
+head(molinetesCantidad)
+```
+
+Veamos cómo se distribuye la cantidad:
+
+```{r,eval=FALSE}
+molinetesCantidad %>%
+  select(COMBINACION,cantidad) %>%
+  distinct() %>%
+  arrange(desc(cantidad)) %>%
+  mutate(COMBINACION=factor(COMBINACION, levels=COMBINACION)) %>%
+  plot_ly(y=~COMBINACION,
+          x=~cantidad,
+          type='bar') %>%
+  layout(title="CANTIDAD DE PASAJEROS POR ESTACIÓN")
+```
+
+La diferencia entre la mayor barra y las menores, permite que se puedan representar todas sin necesidad de recurrir a una escala logarítmica.
+
+## Barrios
+
+Comencemos viendo los archivos que contenía el .rar que descargamos.
+
+```{r}
+dir('data/barrios')
+```
+
+Como vemos, hay un archivo .shp con los datos que necesitamos, lo abrimos con la función `st_read` de la librería `sf`.
+
+```{r}
+barrios <- st_read(paste('data/barrios',dir('data/barrios','\\.shp$'),sep='/'))
+```
+
+Veamos la estructura de este tipo de datos.
+
+```{r}
+str(barrios)
+```
+
+Graficamos:
+
+```{r}
+plot(barrios)
+```
+
+Para trabajar con los datos, vamos a extraer los puntos que forman cada polígono con la función `st_coordinates`.
+
+```{r}
+head(st_coordinates(barrios))
+```
+
+Como podemos ver, tenemos puntos y las variables L1 y L2 que nos indican qué polígono están formando esos puntos.
+
+Pasemos estos datos a un DataFrame redondeando los puntos ya que para la tarea propuesta, no necesitamos tanta precisión.
+
+```{r}
+barriosDF <- data.frame(round(st_coordinates(barrios))) %>% distinct()
+```
+
+Grafiquemos los puntos:
+
+```{r}
+graficaCoord <- function(df) {
+  ggplot(df, aes(x=X,y=Y)) + geom_point(shape=15, size=1) + theme(aspect.ratio=1)
+}
+
+graficaCoord(barriosDF)
+```
+
+Como podemos ver las líneas de los polígonos no están completas, para ello, vamos a completar los puntos de los polígonos faltantes
+
+Comencemos con un solo polígono:
+
+```{r}
+muestra <- filter(barriosDF,L1==1 & L2==1) %>% select (X,Y)
+graficaCoord(muestra)
+```
+
+Generamos las funciones para completar las líneas.
+
+```{r}
+completarLinea <- function(x0,y0,x1,y1){
+#Recibe 2 coordenadas y devuelve un DataFrame con todos los puntos de la línea entre estos 2 puntos  
+  if (x0!=x1){
+    b <- ((y1-y0)/(x1-x0))
+    x <- x0:x1
+    y <- round(y0 + b*(x-x0))
+  } else {
+    y <- y0:y1
+    x=rep(x0,length(y))
+  }
+  
+  return(data.frame(X=x,Y=y))
+}
+
+
+dataOrigenDestino <- function(df,poligono=TRUE){
+#Recibe un DataFrame con coordenadas y devuelve un DataFrame con las coordenadas previas en la línea
+  if(poligono){
+    #Si es un polígono, unir el último punto con el primero
+    df$X1 <- c(df$X[nrow(df)],df$X[-nrow(df)])
+    df$Y1 <- c(df$Y[nrow(df)],df$Y[-nrow(df)])
+  } else {
+    df$X1<-c(df$X[-1],NA)
+    df$Y1<-c(df$Y[-1],NA)
+    df <- df[-nrow(df),]
+  }
+  return(df)
+}
+
+dataCompleta <- function(df,poligono=TRUE){
+#Recibe un DataFrame con varias líneas y polígonos y los completa  
+  apply(dataOrigenDestino(df,poligono),
+        1,
+        function(linea) completarLinea(linea[1],linea[2],linea[3],linea[4])) %>% 
+    bind_rows() %>% 
+    distinct()
+}
+```
+
+Probemos cómo resulta con un solo polígono.
+
+```{r}
+muestraCompleta <- dataCompleta(muestra)
+graficaCoord(muestraCompleta)
+```
+
+Apliquemos a todos los polígonos de Barrio.
+
+```{r}
+barriosCompleta <- lapply((barriosDF %>% group_by(L1,L2) %>% nest())$data,
+                          dataCompleta) %>% 
+                     bind_rows() %>% 
+                     distinct()
+```
+
+Grafiquemos el resultado y comparemos
+
+```{r}
+graficaCoord(barriosCompleta)
+plot(barrios[1])
+```
+
+Como podemos ver, se respeta la forma del original
+
+## Lineas
+
+Importemos y procesemos las líneas de Subte:
+
+```{r}
+lineas <- st_read(paste('data/lineas',dir('data/lineas','\\.shp$'),sep='/'))
+```
+
+```{r}
+plot(lineas)
+```
+
+
+```{r}
+lineasDF <- data.frame(round(st_coordinates(lineas))) %>% distinct()
+graficaCoord(lineasDF)
+```
+
+Procesamos todas las líneas. En esta caso la variable que diferencia cada línea es `L1`.
+
+```{r}
+lineasCompleta <- lapply((group_by(lineasDF,L1) %>% nest())$data,
+                          function(df){df <- dataCompleta(df,poligono = F)}) %>% 
+                     bind_rows() %>% 
+                     distinct()
+```
+
+Comparemos con el original:
+
+```{r}
+graficaCoord(lineasCompleta)
+plot(lineas[2])
+```
+
+Se respeta la estructura del original.
+
+## Estaciones
+
+```{r}
+estaciones <- st_read(paste('data/estaciones',dir('data/estaciones','\\.shp$'),sep='/'))
+```
+
+```{r}
+plot(estaciones)
+```
+
+En este caso vamos a querer conservar atributos de los datos.
+
+```{r}
+str(estaciones)
+```
+
+Además de las coordenadas, vamos a querer mantener las líneas y los nombres de las estaciones.
+
+```{r}
+estacionesDF <- data.frame(estaciones,stringsAsFactors = F) %>% 
+                  select(LINEA,ESTACION) %>% 
+                  mutate(LINEA=as.character(LINEA),
+                         ESTACION=as.character(ESTACION)) %>%
+                  bind_cols(data.frame(round(st_coordinates(estaciones))))
+
+graficaCoord(estacionesDF)
+```
+
+# Representación de la ciudad
+
+Para representar la ciudad, primero revisemos si las coordenadas quedaron alineadas
+
+```{r}
+barriosCompleta %>% 
+  mutate(TIPO="BARRIO") %>% 
+  bind_rows(lineasCompleta %>% 
+              mutate(TIPO="LINEA")) %>% 
+  bind_rows(estacionesDF %>% 
+              mutate(TIPO="ESTACION")) %>% 
+  mutate(TIPO = factor(TIPO,levels=c('BARRIO','LINEA','ESTACION'))) %>% 
+  filter(TIPO == 'BARRIO') %>%
+  ggplot(aes(x=X,y=Y, color=TIPO)) + geom_point(shape=15,size = 1) + scale_colour_manual(values=c('#377eb8','#e41a1c','#4daf4a')) + theme(aspect.ratio=1)
+```
+
+## Generación del archivo .stl
+
+Debido a que para generar el archivo, tenemos que generar una matriz de la superficie a imprimir, se utilizar el DataFrame como está, tendremos una matriz de `r format((max(barriosCompleta$X) - min(barriosCompleta$X) +1)*(max(barriosCompleta$Y) - min(barriosCompleta$Y) +1),scientific=TRUE)` datos, por eso probemos escalar nuestros datos para reducir la dimensión del la matriz resultante.
+
+```{r}
+escalar <- function(escala){
+  barriosCompleta %>% 
+    mutate(TIPO="BARRIO",X=round(X/escala),Y=round(Y/escala)) %>% 
+    bind_rows(lineasCompleta %>% 
+                mutate(TIPO="LINEA",X=round(X/escala),Y=round(Y/escala))) %>% 
+    bind_rows(estacionesDF %>% 
+                mutate(TIPO="ESTACION",X=round(X/escala),Y=round(Y/escala))) %>% 
+    mutate(TIPO = factor(TIPO,levels=c('BARRIO','LINEA','ESTACION'))) %>% 
+    ggplot(aes(x=X,y=Y, color=TIPO)) + geom_point(shape=15,size=1) + scale_colour_manual(values=c('#377eb8','#e41a1c','#4daf4a')) + theme(aspect.ratio=1)
+}
+```
+
+```{r}
+escalar(50)
+```
+
+Utilizando 50, dividimos por 2500 la cantidad de observaciones necesarias sin comprometer la calidad de la impresión.
+
+Generamos el data.frame con las coordenadas en escala:
+
+```{r}
+escala <- 50
+df3D <- barriosCompleta %>% 
+  mutate(TIPO="BARRIO",altura=0.5,X=round(X/escala),Y=round(Y/escala)) %>% 
+  bind_rows(lineasCompleta %>% 
+              mutate(TIPO="LINEA",altura=0.75,X=round(X/escala),Y=round(Y/escala))) %>% 
+  bind_rows(estacionesDF %>% 
+              mutate(TIPO="ESTACION",altura=1,X=round(X/escala),Y=round(Y/escala)))
+```
+
+### Impresión de la Ciudad de Buenos Aires
+
+La librería `r2stl` requiere que se le pasen como argumentos las coordenadas _x_, _y_, _z_ para generar un archivo de extensión .stl, el cual se caracteriza por representar cuerpos geométricos utilizando triángulos. 
+
+Para facilitar la construcción, los puntos en el eje z los vamos a volcar en una matriz.
+
+La representación estará contenida dentro de un cubo y, debido a que la librería va a forzar a que los bordes toquen el cubo (a pesar de ser un parámero, empíricamente el mismo no funcionaría), para mantener la relación de aspecto, la matriz será cuadrada.
+
+Veamos cuál es el eje que posee mayor rango:
+
+```{r}
+print(paste('Rango del Eje X:',max(df3D$X)-min(df3D$X)))
+print(paste('Rango del Eje Y:',max(df3D$Y)-min(df3D$Y)))
+```
+
+Por lo tanto, vamos a hacer una matriz cuadrada de `r max(df3D$Y)-min(df3D$Y)` X `r max(df3D$Y)-min(df3D$Y)`.
+
+```{r}
+#Creamos una matriz de 1's para imprimir el mapa con cierta altura
+matriz <- matrix(1,ncol=max(df3D$Y)-min(df3D$Y)+2,nrow=max(df3D$Y)-min(df3D$Y)+2)
+
+# Para dar grosor a la línea, que cada elemento de la matriz tenga el mismo valor que sus contiguo
+for (i in 0:2){
+  for (j in 0:2){
+    #Los límites de los barrios los representaremos hundidos
+    matriz[as.matrix(df3D %>% 
+                       mutate(X=X-min(X)+i + round(((max(df3D$Y)-min(df3D$Y))-(max(df3D$X)-min(df3D$X)))/2),
+                              Y=Y-min(Y)+j) %>% 
+                       filter(TIPO=='BARRIO') %>% 
+                       select(X,Y))] <-  0.98
+  }
+}
+
+for (i in 0:2){
+  for (j in 0:2){
+    #Las líneas las representaremos sobresaliendo de la superficie
+    matriz[as.matrix(df3D %>% 
+                       mutate(X=X-min(X)+i + round(((max(df3D$Y)-min(df3D$Y))-(max(df3D$X)-min(df3D$X)))/2),
+                              Y=Y-min(Y)+j) %>% 
+                       filter(TIPO=='LINEA') %>% 
+                       select(X,Y))] <- 1.02
+  }
+}
+
+for (i in 0:2){
+  for (j in 0:2){
+    #Las estaciones sobresalen por encima de las líneas
+    matriz[as.matrix(df3D %>% 
+                       mutate(X=X-min(X)+i + round(((max(df3D$Y)-min(df3D$Y))-(max(df3D$X)-min(df3D$X)))/2),
+                              Y=Y-min(Y)+j) %>% 
+                       filter(TIPO=='ESTACION')  %>% 
+                       select(X,Y))] <- 1.04
+  }
+}
+
+#Todo punto por fuera del contorno de la ciudad no tendrá altura
+for (i in 1:nrow(matriz)){
+  contorno <- which(matriz[i,]!=1)
+  if (length(contorno)==0) {
+    matriz[i,]<-0  
+  } else {
+    if (contorno[1]>1){
+      matriz[i,1:(contorno[1]-1)] <-0
+    }
+    if (contorno[length(contorno)]<ncol(matriz)){
+      matriz[i,(contorno[length(contorno)]+1):ncol(matriz)] <-0
+    }
+  }
+}
+
+#Debido a que la librería nos exige una forma cúbica, para mantener las proporciones ponemos un punto de altura 10 que será eliminado
+matriz[1,1]<-10
+```
+
+Generemos una impresión en 3D
+
+```{r}
+persp(matriz,theta = 30, phi = 45,border = NA, expand = 0.5 ,col = "white",shade= 0.75)
+```
+
+Creamos el directorio donde volcar nuestros archivos
+
+```{r}
+dir.create('stl',showWarnings=FALSE)
+```
+
+Exportamos nuestros archivo.
+
+```{r}
+r2stl(x=seq_len(nrow(matriz)),
+      y=seq_len(ncol(matriz)),
+      z=matriz,
+      file="stl/ciudad.stl")
+```
+
+### Impresión Cantidad de Usuarios por estación
+
+#### Unión de datos
+
+Para representar la cantidad de usuarios por estación, debemos unir los datasets correspondientes. Recordemos cómo eran:
+
+```{r}
+head(molinetesCantidad)
+```
+
+```{r}
+head(filter(df3D,TIPO=='ESTACION'))
+```
+
+Veamos si los nombres coinciden
+
+```{r}
+comprobacionNombres <- molinetesCantidad %>% 
+  full_join(filter(df3D,TIPO=='ESTACION') , by=c('LINEA','ESTACION')) %>%
+  mutate(MOLINETES=!is.na(cantidad),
+         ESTACIONES=!is.na(altura)) %>%
+  select(LINEA,ESTACION,MOLINETES,ESTACIONES)
+
+head(comprobacionNombres %>% filter(!(MOLINETES & ESTACIONES)) %>% arrange(LINEA,ESTACION))
+```
+
+Como podemos observar algunos nombres no coinciden, por lo cual tendremos que limpiar los datos.
+
+```{r}
+nombresMolinetes <- (comprobacionNombres %>% 
+                       filter(MOLINETES & !ESTACIONES) %>%  
+                       select(LINEA,ESTACION) %>% 
+                       arrange(LINEA) %>% 
+                       group_by(LINEA) %>% 
+                       nest())$data
+
+nombresEstaciones <- (comprobacionNombres %>% 
+                        filter(ESTACIONES & !MOLINETES) %>% 
+                        arrange(LINEA) %>% 
+                        select(LINEA,ESTACION) %>% 
+                        group_by(LINEA) %>% nest())$data
+```
+
+Usando la función `agrep` hacemos Fuzzy Matching.
+
+```{r}
+nombreEstacionesInter <- lapply(1:6,function(i){
+  ne <- nombresEstaciones[[i]]
+  nm <- nombresMolinetes[[i]]
+  ESTACION_FINAL <- sapply(nm$ESTACION,function(x) agrep(x,ne$ESTACION,value=TRUE,max.distance=0.2))
+    if (class(ESTACION_FINAL)=='list'){
+      ESTACION_FINAL <- do.call('c',ESTACION_FINAL)
+    }
+    nm$ESTACION_FINAL <- ESTACION_FINAL[nm$ESTACION]
+    nm$LINEA <- c(LETTERS[1:5],'H')[i]
+    return(nm)
+}) %>% bind_rows()
+```
+
+Comprobemos si se realizó correctamente.
+
+```{r}
+nombreEstacionesInter %>%
+  filter(ESTACION !=ESTACION_FINAL | is.na(ESTACION_FINAL))
+```
+
+Como podemos observar, los casos que hizo el matching lo hizo correctamente. Los siguientes casos no pudo encontrar una correspondencia:
+
+```{r}
+filter(nombreEstacionesInter,is.na(ESTACION_FINAL))
+```
+
+Veamos los valores para solucionarlo a mano.
+
+```{r}
+lapply(nombresEstaciones,function(x) x$ESTACION)
+```
+
+Como podemos observar, en los datos de referencia geográfica, aún no están los correspondientes a la estación `FACULTAD DE DERECHO` de la línea `H`.
+
+Procedemos a crear una tabla con los nombres finales.
+
+```{r}
+nombreEstacionesInter <- nombreEstacionesInter %>% 
+  filter(ESTACION!='FACULTAD DE DERECHO') %>%
+  mutate(ESTACION_FINAL = case_when(LINEA=='B' & ESTACION=='CARLOS PELLEGRINI' ~ 'C. PELLEGRINI',
+                                    LINEA=='C' & ESTACION=='AVENIDA DE MAYO' ~ 'AV. DE MAYO',
+                                    LINEA=='C' & ESTACION=='GENERAL SAN MARTIN' ~ 'SAN MARTIN',
+                                    LINEA=='C' & ESTACION=='MARIANO MORENO' ~ 'MORENO',
+                                    LINEA=='E' & ESTACION=='AVENIDA LA PLATA' ~ 'AV. LA PLATA',
+                                    LINEA=='E' & ESTACION=='GENERAL BELGRANO' ~ 'BELGRANO',
+                                    TRUE ~ ESTACION_FINAL)) %>%
+  bind_rows(comprobacionNombres %>% 
+              filter(MOLINETES & ESTACIONES) %>%
+              mutate(ESTACION_FINAL=ESTACION) %>%
+              select(ESTACION,ESTACION_FINAL,LINEA))
+```
+
+Generamos la tabla final.
+
+```{r}
+estacionesTOTAL <- molinetesCantidad %>%
+  inner_join(nombreEstacionesInter, by=c('LINEA','ESTACION')) %>%
+  mutate(ESTACION=ESTACION_FINAL) %>%
+  inner_join(filter(df3D,TIPO=='ESTACION') , by=c('LINEA','ESTACION')) %>%
+  group_by(COMBINACION) %>%
+  summarise(cantidad=round(sqrt(mean(cantidad))),
+            X=round(mean(X)),
+            Y=round(mean(Y))) %>%
+  ungroup() %>%
+  arrange(cantidad)
+```
+
+
+```{r}
+head(estacionesTOTAL)
+```
+
+#### Generación de la Matriz
+
+Ahora cada punto donde se ubique una estación no va a tener un valor fijo, sino que el valor de Z los dará la cantidad de personas que haya utilizado la estación.
+
+```{r}
+matriz <- matrix(1,ncol=max(df3D$Y)-min(df3D$Y)+2,nrow=max(df3D$Y)-min(df3D$Y)+2)
+
+for (i in 0:2){
+  for (j in 0:2){
+    matriz[as.matrix(df3D %>% 
+                       mutate(X=X-min(X)+i + round(((max(df3D$Y)-min(df3D$Y))-(max(df3D$X)-min(df3D$X)))/2),
+                              Y=Y-min(Y)+j) %>% 
+                       filter(TIPO=='BARRIO') %>% 
+                       select(X,Y))] <-  0.98
+  }
+}
+
+for (i in -1:3){
+  for (j in -1:3){
+    matriz[as.matrix(df3D %>% 
+                       mutate(X=X-min(X)+i + round(((max(df3D$Y)-min(df3D$Y))-(max(df3D$X)-min(df3D$X)))/2),
+                              Y=Y-min(Y)+j) %>% 
+                       filter(TIPO=='LINEA') %>% 
+                       select(X,Y))] <- 1.02
+  }
+}
+
+#En las coordenadas correspondientes a las estaciones, la altura será determinada por la cantidad de personas.
+#El ancho debe ser mayor ya que de ser muy fina, la columna vertical puede caerse
+for (i in -2:4){
+  for (j in -2:4){
+    #Se le da el valor correspondiente, escalado a 9
+    matriz[cbind(estacionesTOTAL$X-min(df3D$X)+ i + round(((max(df3D$Y)-min(df3D$Y))-(max(df3D$X)-min(df3D$X)))/2),
+           estacionesTOTAL$Y-min(df3D$Y)+ j)]<-(9/max(estacionesTOTAL$cantidad))*estacionesTOTAL$cantidad
+  }
+}
+
+for (i in 1:nrow(matriz)){
+  
+  contorno <- which(matriz[i,]!=1)
+  
+  if (length(contorno)==0) {
+    matriz[i,]<-0  
+  } else {
+    if (contorno[1]>1){
+      matriz[i,1:(contorno[1]-1)] <-0
+    }
+    if (contorno[length(contorno)]<ncol(matriz)){
+      matriz[i,(contorno[length(contorno)]+1):ncol(matriz)] <-0
+    }
+  }
+}
+
+matriz[1,1] <- 15
+```
+
+```{r}
+#Cambiar por persp3d en caso de usar modo interactivo
+persp(matriz,theta = 30, phi = 45,border = NA, expand = 1 ,col = "white",shade= 0.75)
+```
+
+Exportamos el archivo
+
+```{r}
+r2stl(x=seq_len(nrow(matriz)),
+      y=seq_len(ncol(matriz)),
+      z=matriz,
+      file="stl/ciudadBarras.stl")
+```
+
+## Contacto
+Twitter: [http://www.twitter.com/lucpogo](http://www.twitter.com/lucpogo)
+
+Github: [http://www.github.com/lucpogo/impresion3D](http://www.github.com/lucpogo/impresion3D)
