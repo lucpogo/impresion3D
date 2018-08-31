@@ -9,8 +9,8 @@ Generación utilizando R del archivo .stl para imprimir en 3D
 - `plotly` para gráficos 2D interactivos
 
 ## Especificaciones del sistema
-R version 3.5.1 (2018-07-02)
-Platform: x86_64-pc-linux-gnu (64-bit)
-Running under: Linux Mint 19
-Procesador: Intel© Core™ i7-8550U
-Memoria Ram: 16GB
+- R version 3.5.1 (2018-07-02)
+- Platform: x86_64-pc-linux-gnu (64-bit)
+- Running under: Linux Mint 19
+- Procesador: Intel© Core™ i7-8550U
+- Memoria Ram: 16GB
